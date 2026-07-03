@@ -1,0 +1,6 @@
+playwright>=1.40
+pydantic>=2.0
+rich>=13.0
+tenacity>=8.0
+structlog>=24.0
+playwright-stealth

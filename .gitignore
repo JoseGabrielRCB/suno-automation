@@ -1,0 +1,25 @@
+# Estado de progresso (runtime — específico de cada máquina/execução)
+json/
+*.backup_*.json
+
+# Artefatos de execução
+logs/
+screenshots/
+
+# Conteúdo real das letras (cada máquina traz o seu; versione só o exemplo)
+musicas/*.md
+!musicas/EXEMPLO.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
