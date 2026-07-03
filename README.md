@@ -13,6 +13,31 @@ autenticado** (via CDP) e cria as músicas uma a uma — persistindo o progresso
 
 ---
 
+## 📌 Status do projeto
+
+### Onde paramos na última execução
+- **147 / 325** músicas enviadas. Retomar em **`S - Vanerao - 06.md::23`**.
+- Cobertura: **L01–L05** completos (25/25), **L06** em 22/25, **L07–L13** ainda 0/25.
+- **Falta terminar:** L06 (músicas 23–25) + **L07 a L13 inteiros** = **178 músicas**.
+- Para retomar, é só rodar o fluxo normal (o `suno_state.json` pula o que já foi feito).
+
+### O que falta terminar (desenvolvimento)
+Detecção de captcha anti-robô + alarme sonoro está na branch **`verificacao`** (validada em
+produção). Pendente antes de mesclar na `main`:
+- [ ] Autoteste por máquina (`selftest_captcha.py`) — valida o alarme sem esperar captcha real.
+- [ ] Opção de alarme **rápido** (~3s) detectando o desafio direto no DOM (hoje o alarme
+      leva ~40s, pois o Suno só debita o crédito ~39s após o Create).
+- [ ] Revisar e **mesclar `verificacao` → `main`** após os itens acima.
+
+> **Detecção de captcha (branch `verificacao`):** o hCaptcha do Suno é *passivo* (o iframe
+> fica oculto entre as músicas), então detectar "iframe presente" dá falso-positivo. O sinal
+> confiável é o **crédito**: se após o *Create* o crédito **não cai**, a submissão foi barrada
+> por um captcha visível → **alarme (`winsound`) em loop até você resolver**. Espera 30 min;
+> se não resolver, **para o run** (nunca segue sem o operador). Marca `"captcha": true` no
+> estado das músicas que exigiram verificação.
+
+---
+
 ## 1. Instalação (uma vez por máquina)
 
 ```bash
