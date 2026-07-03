@@ -55,9 +55,8 @@ from playwright.sync_api import (
 # CONFIGURAÇÃO GLOBAL — edite aqui livremente
 # ───────────────────────────────────────────────────────────────────────────
 
-# URL usada no page.goto. Configure por variável de ambiente para não ter de editar
-# o código em cada máquina:
-#   SUNO_CREATE_URL="https://suno.com/create?wid=<seu_workspace_id>"
+# URL usada no page.goto. Configure por variável de ambiente para não editar o código
+# em cada máquina: SUNO_CREATE_URL="https://suno.com/create?wid=<seu_workspace_id>"
 # Sem a variável, usa o workspace padrão da conta logada no Chrome (sem wid).
 CREATE_URL = os.environ.get("SUNO_CREATE_URL", "https://suno.com/create")
 
@@ -74,6 +73,14 @@ CAPTCHA_WAIT_TIMEOUT_S = 180   # tempo máx. aguardando o usuário resolver o ca
 CAPTCHA_POLL_S = 3             # intervalo entre verificações/buzz enquanto aguarda
 CAPTCHA_MIN_SIZE = 60          # altura mín. (px) do iframe p/ contar como desafio visível
 CAPTCHA_BUZZ_FREQS = (1000, 1400)  # frequências (Hz) do beep de alerta
+
+# DETECÇÃO PRIMÁRIA DE BLOQUEIO POR CRÉDITO — o hCaptcha do Suno é PASSIVO: o iframe
+# do desafio fica pré-carregado e OCULTO no DOM quase sempre, então "iframe presente"
+# gera falso-positivo. Sinal confiável: se após o Create o crédito NÃO cair, a
+# submissão foi barrada (captcha visível) → alarme em loop até o usuário resolver.
+BLOCK_GRACE_S = 12             # janela p/ o contador de crédito atualizar (lag do Suno)
+BLOCK_POLL_S = 4              # intervalo entre buzzes enquanto bloqueado
+BLOCK_WAIT_TIMEOUT_S = 1800    # 30 min apitando; se não resolver, PARA o run (não segue sem você)
 
 # Limites de campo confirmados no DOM
 TITLE_MAXLEN = 200    # sem maxlength no DOM — limite conservador
@@ -653,11 +660,56 @@ def wait_for_captcha(page: Page, song: Song, raise_on_timeout: bool = True) -> N
         raise PreSubmitError("captcha não resolvido dentro do tempo limite")
 
 
-def process_song(page: Page, song: Song, dry_run: bool) -> tuple[str, Optional[str], Optional[int]]:
+def _credit_dropped(pre: Optional[int], cur: Optional[int]) -> bool:
+    """True se dá p/ afirmar que um crédito foi gasto (submissão passou)."""
+    return pre is not None and cur is not None and cur < pre
+
+
+def wait_for_block_resolution(page: Page, song: Song, pre_credits: Optional[int]) -> str:
+    """Detector PRIMÁRIO de bloqueio. Após o Create, confirma pelo CRÉDITO se a
+    submissão passou. Se o crédito NÃO caiu, trata como bloqueio (captcha visível
+    barrando o submit) e ALARMA EM LOOP até o crédito cair (usuário resolveu) ou
+    estourar o tempo. Puramente observacional — NUNCA re-clica Create (credit-safe).
+
+    Retorna: "clear" (crédito caiu, sem bloqueio), "resolved" (bloqueou e foi
+    resolvido) ou "timeout" (bloqueou e não resolveu no tempo — o chamador PARA o run).
+    """
+    if pre_credits is None:
+        return "clear"  # sem baseline de crédito não dá p/ inferir bloqueio
+    # Janela de graça: o contador do Suno tem lag; espera cair antes de alarmar.
+    grace_deadline = time.time() + BLOCK_GRACE_S
+    while time.time() < grace_deadline:
+        if _credit_dropped(pre_credits, read_credits(page)):
+            return "clear"  # crédito caiu → submissão passou, sem bloqueio
+        page.wait_for_timeout(1500)
+    # Crédito não caiu na graça → provável bloqueio. Alarme repetido até resolver.
+    log.warning("bloqueio_detectado", song=song.key, credits=pre_credits,
+                msg="crédito não caiu após Create — provável captcha visível bloqueando")
+    console.print(
+        f"[bold red]🔔 BLOQUEIO em '{song.title}' — resolva a verificação no navegador. "
+        f"Alarme tocando até o crédito cair (não submeto mais nada até você resolver).[/bold red]"
+    )
+    screenshot(page, f"block_song{song.index}")
+    deadline = time.time() + BLOCK_WAIT_TIMEOUT_S
+    while time.time() < deadline:
+        buzz(repeats=3)  # alarme repetido/insistente
+        page.wait_for_timeout(BLOCK_POLL_S * 1000)
+        if _credit_dropped(pre_credits, read_credits(page)):
+            log.info("bloqueio_resolvido", song=song.key)
+            console.print("[green]Crédito caiu — bloqueio resolvido, retomando.[/green]")
+            return "resolved"
+    log.warning("bloqueio_timeout", song=song.key,
+                msg=f"não resolvido em {BLOCK_WAIT_TIMEOUT_S // 60} min — parando o run")
+    return "timeout"
+
+
+def process_song(page: Page, song: Song, dry_run: bool) -> tuple[str, Optional[str], Optional[int], bool]:
     """Processa uma música na ordem obrigatória do briefing.
 
-    Retorna (status, song_id, credits). status ∈ {completed, submitted_timeout, dry_run}.
-    Levanta PreSubmitError (antes do clique, sem gasto) ou StopAll (créditos).
+    Retorna (status, song_id, credits, captcha_seen). status ∈ {completed,
+    submitted_timeout, dry_run}. captcha_seen=True se um bloqueio de captcha foi
+    detectado e resolvido durante esta música.
+    Levanta PreSubmitError (antes do clique, sem gasto) ou StopAll (créditos/bloqueio).
     Importante: nenhum PreSubmitError é levantado após o clique em Create, então
     re-tentar este método nunca causa débito duplo.
     """
@@ -692,7 +744,7 @@ def process_song(page: Page, song: Song, dry_run: bool) -> tuple[str, Optional[s
     # g. dry-run: screenshot e pula sem clicar
     if dry_run:
         screenshot(page, f"dryrun_song{song.index}")
-        return "dry_run", None, credits
+        return "dry_run", None, credits, False
 
     # h. clicar Create (débito ocorre AQUI, irreversível)
     log.info("create_click", song=song.key, title=song.title)
@@ -704,7 +756,19 @@ def process_song(page: Page, song: Song, dry_run: bool) -> tuple[str, Optional[s
 
     # i. aguardar conclusão
     status, song_id = wait_for_completion(page)
-    return status, song_id, credits
+
+    # i2. DETECÇÃO PRIMÁRIA DE BLOQUEIO: se o crédito não caiu, a submissão foi barrada
+    # (captcha visível) → alarme em loop até resolver. Se não resolver em 30 min, PARA o
+    # run inteiro (StopAll) — nunca segue submetendo sem você. Observacional; nunca re-clica.
+    block = wait_for_block_resolution(page, song, credits)
+    if block == "timeout":
+        raise StopAll(
+            f"bloqueio de captcha não resolvido em {BLOCK_WAIT_TIMEOUT_S // 60} min "
+            f"(música '{song.title}') — parando para não seguir sem você"
+        )
+    captcha_seen = (block == "resolved")
+
+    return status, song_id, credits, captcha_seen
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -851,12 +915,12 @@ def run(args: argparse.Namespace) -> int:
                 task = progress.add_task("Processando", total=len(queue))
                 for song in queue:
                     progress.update(task, description=f"#{song.index} {song.title[:30]}")
-                    status, song_id, song_credits = "failed", None, None
+                    status, song_id, song_credits, captcha_seen = "failed", None, None, False
 
                     # Até 2 tentativas: 1 normal + 1 fallback (só erros pré-submit).
                     for attempt in (1, 2):
                         try:
-                            status, song_id, song_credits = process_song(page, song, args.dry_run)
+                            status, song_id, song_credits, captcha_seen = process_song(page, song, args.dry_run)
                             break
                         except StopAll as e:
                             stop_reason = str(e)
@@ -899,11 +963,14 @@ def run(args: argparse.Namespace) -> int:
                     entry = {"status": status, "title": song.title, "ts": _now()}
                     if song_id:
                         entry["song_id"] = song_id
+                    if captcha_seen:
+                        entry["captcha"] = True  # esta música exigiu resolver um captcha
                     if status == "failed":
                         entry["error"] = "ver screenshots/logs"
                     state[song.key] = entry
                     save_state(STATE_FILE, state)
-                    log.info("estado_salvo", song=song.key, status=status, song_id=song_id)
+                    log.info("estado_salvo", song=song.key, status=status,
+                             song_id=song_id, captcha=captcha_seen)
 
                     if status == "failed":
                         consecutive_errors += 1
